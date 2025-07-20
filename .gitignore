@@ -1,0 +1,33 @@
+# Dossiers d’environnements (si jamais tu en crées un dans le projet)
+.env/
+.venv/
+env/
+venv/
+
+# Fichiers conda générés
+*.conda
+*.lock
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Répertoires de build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Dossier VS Code
+.vscode/
+
+# Logs
+*.log
+
+# Fichiers système
+.DS_Store
+Thumbs.db
