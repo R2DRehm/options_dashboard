@@ -1,3 +1,4 @@
+# utils/helpers.py - updated to avoid FutureWarnings and use groupby['pnl'].last()
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -50,14 +51,14 @@ def summarize_pnl(df: pd.DataFrame) -> pd.DataFrame:
     Calcule des statistiques de PnL final par scénario :
     - mean, std, median, quantiles (5%, 95%)
     """
-    last = df.groupby('scenario').apply(lambda g: g.iloc[-1]['pnl'])
+    last = df.groupby('scenario')['pnl'].last()
     summary = pd.DataFrame({
         'mean': last.mean(),
         'std': last.std(),
         'median': last.median(),
         '5%': last.quantile(0.05),
         '95%': last.quantile(0.95)
-    }, index=[0]).T
+    }, index=['value']).T
     return summary
 
 
@@ -66,8 +67,8 @@ def compute_var(df: pd.DataFrame, alpha: float = 0.05) -> float:
     Calcule la VaR à niveau alpha sur le PnL final de tous les scénarios.
     VaR est le quantile alpha (perte maximale) :
     """
-    last = df.groupby('scenario').apply(lambda g: g.iloc[-1]['pnl'])
-    return np.percentile(-last, 100 * alpha)
+    last = df.groupby('scenario')['pnl'].last()
+    return np.percentile(-last.values, 100 * alpha)
 
 
 def save_simulation(df: pd.DataFrame, filepath: str):
