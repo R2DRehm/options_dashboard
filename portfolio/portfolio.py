@@ -1,131 +1,126 @@
+"""portfolio/portfolio.py – Gestion dynamique de portefeuille d’options
+
+Principales classes :
+    • OptionOrder   – décrit un ordre passé sur le grid discret.
+    • Portfolio     – agrège les ordres et calcule PnL & grecques au snapshot voulu.
+
+Dépendances :
+    - simulation.correlated_paths.generate_paths
+    - options.option_pricing (grecs, pricing)
+"""
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass
+from typing import List
+
 import numpy as np
 import pandas as pd
-from simulation.price_simulation import generate_gbm_paths
-from simulation.vol_rates_simulation import generate_ou_paths, generate_vasicek_paths
+
 from options.option_pricing import (
-    bs_price, bs_delta, bs_gamma, bs_vega, bs_theta, bs_rho
+    bs_price,
+    bs_delta,
+    bs_gamma,
+    bs_vega,
+    bs_theta,
+    bs_rho,
 )
 
 
-class OptionPosition:
-    def __init__(
-        self,
-        option_type: str,
-        K: float,
-        T0: float,
-        quantity: float = 1.0
-    ):
-        """
-        option_type: 'call' ou 'put'
-        K: strike
-        T0: maturité initiale (années)
-        quantity: nombre de contrats (>0 long, <0 short)
-        """
-        self.option_type = option_type.lower()
-        self.K = K
-        self.T0 = T0
-        self.quantity = quantity
+def _maturity_remaining(T0: float, t_current: float) -> float:
+    """Maturité résiduelle non‑négative."""
+    return max(T0 - t_current, 0.0)
 
-    def pnl_and_greeks(
-        self,
-        S_path: np.ndarray,
-        r_path: np.ndarray,
-        sigma_path: np.ndarray,
-        time_grid: np.ndarray
-    ) -> pd.DataFrame:
-        """
-        Calcule PnL et grecs le long d'une trajectoire:
-        - S_path: prix spot (taille N+1)
-        - r_path: taux sans risque (taille N+1)
-        - sigma_path: volatilité spot (taille N+1)
-        - time_grid: instants t de 0 à T0 (taille N+1)
-        Retourne DataFrame ['t','S','r','sigma','price','delta','gamma','vega','theta','rho','pnl']
-        """
+
+@dataclass
+class OptionOrder:
+    """Représente un ordre passé à un snapshot discret."""
+
+    time_idx: int  # indice dans coarse grid
+    option_type: str  # "call" | "put"
+    strike: float
+    quantity: float  # nb contrats (+ long, − short)
+    maturity: float  # constante en années depuis t=0
+
+
+class Portfolio:
+    """Portefeuille d’OptionOrder sur une trajectoire simulée."""
+
+    def __init__(self, path_dict: dict[str, np.ndarray]):
+        self.path = path_dict  # dict retourné par generate_paths
+        self.orders: List[OptionOrder] = []
+
+    # ------------------------------------------------------------------
+    # Gestion des ordres
+    # ------------------------------------------------------------------
+    def add_order(self, order: OptionOrder):
+        self.orders.append(order)
+
+    # ------------------------------------------------------------------
+    # Valeur + grecques au snapshot courant
+    # ------------------------------------------------------------------
+    def state_at(self, idx: int) -> pd.DataFrame:
+        """Calcule la valeur et les grecques du portefeuille au snapshot `idx`."""
+        if not self.orders:
+            return pd.DataFrame()
+
+        t_grid = self.path["t_fine"]
+        coarse_idx = self.path["coarse_idx"]
+        # index fin correspondant au coarse snapshot
+        j = coarse_idx[idx]
+        t_now = t_grid[j]
+        S = self.path["S"][j]
+        r = self.path["r"][j]
+        sigma = np.sqrt(self.path["V"][j])
+
         records = []
-        # Prix initial
-        price0 = bs_price(S_path[0], self.K, self.T0, r_path[0], sigma_path[0], self.option_type)
-        for t, S, r, vol in zip(time_grid, S_path, r_path, sigma_path):
-            tau = max(self.T0 - t, 0)
-            price = bs_price(S, self.K, tau, r, vol, self.option_type)
-            delta = bs_delta(S, self.K, tau, r, vol, self.option_type)
-            gamma = bs_gamma(S, self.K, tau, r, vol)
-            vega  = bs_vega(S, self.K, tau, r, vol)
-            theta = bs_theta(S, self.K, tau, r, vol, self.option_type)
-            rho   = bs_rho(S, self.K, tau, r, vol, self.option_type)
-            pnl   = (price - price0) * self.quantity
+        for order in self.orders:
+            if order.time_idx > idx:
+                # ordre pas encore actif
+                continue
+            tau = _maturity_remaining(order.maturity, t_now)
+            price = bs_price(S, order.strike, tau, r, sigma, order.option_type)
+            delta = bs_delta(S, order.strike, tau, r, sigma, order.option_type)
+            gamma = bs_gamma(S, order.strike, tau, r, sigma)
+            vega = bs_vega(S, order.strike, tau, r, sigma)
+            theta = bs_theta(S, order.strike, tau, r, sigma, order.option_type)
+            rho = bs_rho(S, order.strike, tau, r, sigma, order.option_type)
+
             records.append({
-                't': t,
-                'S': S,
-                'r': r,
-                'sigma': vol,
-                'price': price,
-                'delta': delta,
-                'gamma': gamma,
-                'vega': vega,
-                'theta': theta,
-                'rho': rho,
-                'pnl': pnl
+                "option_type": order.option_type,
+                "strike": order.strike,
+                "qty": order.quantity,
+                "price": price * order.quantity,
+                "delta": delta * order.quantity,
+                "gamma": gamma * order.quantity,
+                "vega": vega * order.quantity,
+                "theta": theta * order.quantity,
+                "rho": rho * order.quantity,
             })
-        return pd.DataFrame(records)
 
+        if not records:
+            return pd.DataFrame()
 
-class PortfolioSimulator:
-    def __init__(
-        self,
-        positions: list[OptionPosition],
-        S_params: dict,
-        vol_params: dict,
-        rate_params: dict,
-        T: float,
-        N: int,
-        M: int,
-        seed: int = None
-    ):
-        """
-        positions: liste d'OptionPosition
-        S_params: dict{'S0','mu','sigma'} pour GBM
-        vol_params: dict{'x0','kappa','theta','xi'} pour OU
-        rate_params: dict{'r0','kappa','theta','sigma'} pour Vasicek
-        T: horizon (années), N: pas de temps, M: nb trajectoires
-        seed: graine unifiée
-        """
-        self.positions = positions
-        self.S_params = S_params
-        self.vol_params = vol_params
-        self.rate_params = rate_params
-        self.T = T
-        self.N = N
-        self.M = M
-        self.seed = seed
+        df = pd.DataFrame(records)
+        totals = df[["price", "delta", "gamma", "vega", "theta", "rho"]].sum()
+        totals["option_type"] = "TOTAL"
+        totals["strike"] = "-"
+        totals["qty"] = df["qty"].sum()
+        df_tot = pd.concat([df, totals.to_frame().T], ignore_index=True)
+        return df_tot
 
-    def run(self) -> pd.DataFrame:
-        """
-        Simule trajectoires et calcule PnL & grecques pour chaque position et scénario.
-        Retourne DataFrame concaténé avec colonnes ['scenario','position','t',...].
-        """
-        # Dérouler paramètres
-        S0, mu, sigma_sim = self.S_params['S0'], self.S_params['mu'], self.S_params['sigma']
-        x0, kappa_v, theta_v, xi = (
-            self.vol_params['x0'], self.vol_params['kappa'],
-            self.vol_params['theta'], self.vol_params['xi']
-        )
-        r0, kappa_r, theta_r, sigma_r = (
-            self.rate_params['r0'], self.rate_params['kappa'],
-            self.rate_params['theta'], self.rate_params['sigma']
-        )
-        # Simulations
-        price_paths = generate_gbm_paths(S0, mu, sigma_sim, self.T, self.N, self.M, seed=self.seed)
-        vol_paths   = generate_ou_paths(x0, kappa_v, theta_v, xi, self.T, self.N, self.M, seed=self.seed)
-        rate_paths  = generate_vasicek_paths(r0, kappa_r, theta_r, sigma_r, self.T, self.N, self.M, seed=self.seed)
-        time_grid = np.linspace(0, self.T, self.N + 1)
-
-        results = []
-        for i in range(self.M):
-            for pos in self.positions:
-                df = pos.pnl_and_greeks(
-                    price_paths[i], rate_paths[i], vol_paths[i], time_grid
-                )
-                df['scenario'] = i
-                df['position'] = f"{pos.option_type}_{pos.K}"
-                results.append(df)
-        return pd.concat(results, ignore_index=True)
+    # ------------------------------------------------------------------
+    # Helpers pour grecs/PnL time series (pour les graphiques)
+    # ------------------------------------------------------------------
+    def greeks_over_time(self) -> pd.DataFrame:
+        """Calcule la série temporelle agrégée des grecques du portefeuille."""
+        coarse_len = len(self.path["coarse_idx"])
+        rows = []
+        for idx in range(coarse_len):
+            st = self.state_at(idx)
+            if st.empty:
+                rows.append({"idx": idx, "price": 0, "delta": 0, "gamma": 0, "vega": 0, "theta": 0, "rho": 0})
+            else:
+                tot = st.iloc[-1]  # dernière ligne = TOTAL
+                rows.append({"idx": idx, **tot[["price", "delta", "gamma", "vega", "theta", "rho"]]})
+        return pd.DataFrame(rows)
