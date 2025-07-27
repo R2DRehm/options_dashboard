@@ -78,6 +78,24 @@ class Portfolio:
             if order.time_idx > idx:
                 # ordre pas encore actif
                 continue
+
+                        # ----- Sous-jacent simple -----
+            if order.option_type == "underlying":
+                price = S * order.quantity
+                records.append({
+                    "option_type": "Underlying",
+                    "strike": "-",
+                    "qty": order.quantity,
+                    "price": price,
+                    "delta": order.quantity,  # Δ = 1
+                    "gamma": 0.0,
+                    "vega":  0.0,
+                    "theta": 0.0,
+                    "rho":   0.0,
+                })
+                continue  # passe au prochain ordre
+
+
             tau = _maturity_remaining(order.maturity, t_now)
             price = bs_price(S, order.strike, tau, r, sigma, order.option_type)
             delta = bs_delta(S, order.strike, tau, r, sigma, order.option_type)

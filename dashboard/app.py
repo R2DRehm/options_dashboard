@@ -100,33 +100,35 @@ def sidebar() -> html.Div:
                         style={"marginTop": "10px", "width": "100%"}),
 
             html.Hr(),  # ------------- ORDERS -------------
-            html.H3("Add / Remove order"),
+            html.H3("Add / Remove position"),
 
-            html.Label("Type"),
-            dcc.Dropdown(id="opt-type",
-                         options=[{"label": "Call", "value": "call"},
-                                  {"label": "Put",  "value": "put"}],
-                         value="call"),
+            # ─── Instrument selector ──────────────────────────
+            html.Label("Instrument"),
+            dcc.Dropdown(
+                id="instr-type",
+                options=[
+                    {"label": "Underlying", "value": "underlying"},
+                    {"label": "Call",       "value": "call"},
+                    {"label": "Put",        "value": "put"},
+                ],
+                value="underlying",
+            ),
 
             html.Label("Strike"),
             dcc.Input(id="strike", type="number", value=100, step=1),
 
             html.Label("Qty (+ long / − short)"),
-            dcc.Input(id="qty", type="number", value=1, step=1),
+            dcc.Input(id="qty", type="number", value=1, step=0.1),
 
             html.Label("Maturity (years)"),
             dcc.Input(id="maturity", type="number", value=1.0, step=0.1),
             html.Br(),
 
-            html.Button("Add Order",   id="btn-add",
-                        n_clicks=0, style={"width": "49%", "marginTop": "8px"}),
-
-            html.Button("Remove Last", id="btn-remove",
-                        n_clicks=0, style={"width": "49%", "marginLeft": "2%"}),
-
+            html.Button("Add",   id="btn-add",    n_clicks=0, style={"width": "49%", "marginTop": "8px"}),
+            html.Button("Remove last", id="btn-remove", n_clicks=0, style={"width": "49%", "marginLeft": "2%"}),
             html.Br(),
-            html.Button("Reset Orders", id="btn-reset",
-                        n_clicks=0, style={"marginTop": "10px", "width": "100%"}),
+            html.Button("Reset", id="btn-reset", n_clicks=0, style={"marginTop": "10px", "width": "100%"}),
+
 
             html.Hr(),  # ------------- PORTFOLIO TABLE -------------
             html.H3("Portfolio @ snapshot"),
@@ -142,18 +144,31 @@ def sidebar() -> html.Div:
 
 
 def main_panel() -> html.Div:
-    """Right : graphs + slider (small height graphs)."""
-    small = {"height": "230px"}   # taille réduite
+    """Right panel: graphs in two columns + slider + PnL graph."""
+    small_style = {"height": "230px"}
+
+    # Grille 2 colonnes, 7 graphiques (Spot, PnL, puis 5 grecques)
+    graphs_grid = html.Div(
+        style={
+            "display": "grid",
+            "gridTemplateColumns": "1fr 1fr",
+            "gap": "10px",
+        },
+        children=[
+            dcc.Graph(id="graph-paths",  style=small_style),
+            dcc.Graph(id="graph-pnl",    style=small_style),
+            dcc.Graph(id="graph-delta",  style=small_style),
+            dcc.Graph(id="graph-gamma",  style=small_style),
+            dcc.Graph(id="graph-vega",   style=small_style),
+            dcc.Graph(id="graph-theta",  style=small_style),
+            dcc.Graph(id="graph-rho",    style=small_style),
+        ],
+    )
 
     return html.Div(
         style={"width": "75%", "padding": "15px"},
         children=[
-            dcc.Graph(id="graph-paths",  style=small),
-            dcc.Graph(id="graph-delta",  style=small),
-            dcc.Graph(id="graph-gamma",  style=small),
-            dcc.Graph(id="graph-vega",   style=small),
-            dcc.Graph(id="graph-theta",  style=small),
-            dcc.Graph(id="graph-rho",    style=small),
+            graphs_grid,
             html.Br(),
             dcc.Slider(id="time-slider", min=0, max=10, step=1, value=0),
         ],
@@ -203,14 +218,24 @@ def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, t
     Input("btn-add", "n_clicks"),
     State("orders-json", "data"),
     State("time-slider", "value"),
-    State("opt-type", "value"), State("strike", "value"), State("qty", "value"), State("maturity", "value"),
+    State("instr-type", "value"),  
+    State("strike", "value"),
+    State("qty", "value"),
+    State("maturity", "value"),
     prevent_initial_call=True,
 )
-def add_order_callback(_, orders, idx, opt_type, strike, qty, maturity):
+def add_order_callback(_, orders, idx, instr, strike, qty, maturity):
     if orders is None:
         orders = []
-    orders.append({"time_idx": int(idx), "option_type": opt_type, "strike": strike, "quantity": qty, "maturity": maturity})
+    orders.append({
+        "time_idx": int(idx),
+        "option_type": instr,    
+        "strike": strike or 0.0,
+        "quantity": qty,
+        "maturity": maturity or 0.0
+    })
     return orders
+
 
 
 @app.callback(
@@ -251,10 +276,11 @@ import pandas as pd
 
 @app.callback(
     Output("graph-paths", "figure"),
+    Output("graph-pnl",   "figure"),
     Output("graph-delta", "figure"),
     Output("graph-gamma", "figure"),
     Output("graph-vega",  "figure"),
-    Output("graph-theta", "figure"),
+    Output("graph-theta","figure"),
     Output("graph-rho",   "figure"),
     Output("table-positions", "data"),
     Output("table-positions", "columns"),
@@ -263,6 +289,7 @@ import pandas as pd
     Input("orders-json", "data"),
     prevent_initial_call=True,
 )
+
 def update_view(idx: int, paths_json: dict | None, orders: list | None):
     if not paths_json:
         raise dash.exceptions.PreventUpdate
@@ -290,6 +317,12 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None):
 
     greeks_df = portfolio.greeks_over_time()
 
+    # ----- PnL over time -----
+    pnl_df = greeks_df[['idx','price']].rename(columns={'price':'pnl'})
+    fig_pnl = px.line(pnl_df, x='idx', y='pnl', title='Portfolio PnL vs snapshot')
+    fig_pnl.add_vline(x=idx, line_width=1, line_dash='dot', line_color='black')
+    fig_pnl.update_layout(height=230, margin=dict(l=50, r=20, t=30, b=20))
+
     # Helper pour chaque grecque
     def greek_fig(column: str, title: str):
         fig = px.line(greeks_df, x="idx", y=column, title=title)
@@ -306,12 +339,11 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None):
     # ---------- 4) Tableau des positions ----------
     snapshot_df = portfolio.state_at(idx)
     if snapshot_df.empty:
-        return fig_paths, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, [], []
+        return fig_paths, fig_pnl, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, [], []
 
     table_data = snapshot_df.to_dict("records")
     columns    = [{"name": c, "id": c} for c in snapshot_df.columns]
-
-    return fig_paths, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, table_data, columns
+    return fig_paths, fig_pnl, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, table_data, columns
 
 
 # ----------------------------------------------------------------------------
