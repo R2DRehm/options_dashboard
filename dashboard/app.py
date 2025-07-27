@@ -41,7 +41,7 @@ from dash import dcc, html, dash_table   # vérifie que dash_table est bien impo
 def sidebar() -> html.Div:
     """Left panel: simulation params + order form + portfolio table."""
     return html.Div(
-        style={"width": "25%", "padding": "15px",
+        style={"width": "10%", "padding": "15px",
                "overflowY": "auto", "background": "#f1f3f4"},
         children=[
             html.H3("Simulation"),
@@ -307,8 +307,11 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None):
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=np.sqrt(path["V"]), name="σ"),    secondary_y=True)
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=path["r"],          name="r"),    secondary_y=True)
     fig_paths.add_vline(x=t_now, line_width=1, line_dash="dot", line_color="black")
-    fig_paths.update_layout(title="Spot / σ / r – full path", height=230,
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig_paths.update_layout(
+        title="Spot / σ / r – full path",
+        height=320,  # Hauteur alignée sur le CSS du main_panel()
+    )
+
 
     # ---------- 3) Construire le portefeuille ----------
     portfolio = Portfolio(path)
