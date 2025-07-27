@@ -144,35 +144,28 @@ def sidebar() -> html.Div:
 
 
 def main_panel() -> html.Div:
-    """Right panel: graphs in two columns + slider + PnL graph."""
-    small_style = {"height": "230px"}
-
-    # Grille 2 colonnes, 7 graphiques (Spot, PnL, puis 5 grecques)
-    graphs_grid = html.Div(
-        style={
-            "display": "grid",
-            "gridTemplateColumns": "1fr 1fr",
-            "gap": "10px",
-        },
+    """Right panel with left/right arrows and paged content."""
+    nav = html.Div(
+        style={"display": "flex", "justifyContent": "space-between", "marginBottom": "10px"},
         children=[
-            dcc.Graph(id="graph-paths",  style=small_style),
-            dcc.Graph(id="graph-pnl",    style=small_style),
-            dcc.Graph(id="graph-delta",  style=small_style),
-            dcc.Graph(id="graph-gamma",  style=small_style),
-            dcc.Graph(id="graph-vega",   style=small_style),
-            dcc.Graph(id="graph-theta",  style=small_style),
-            dcc.Graph(id="graph-rho",    style=small_style),
+            html.Button("◀", id="btn-prev", n_clicks=0, style={"width": "60px"}),
+            html.Button("▶", id="btn-next", n_clicks=0, style={"width": "60px"}),
         ],
     )
 
+    # Container whose children we will swap (graphs or table)
+    page = html.Div(id="page-content")
+
     return html.Div(
-        style={"width": "75%", "padding": "15px"},
+        style={"width": "90%", "padding": "15px"},
         children=[
-            graphs_grid,
+            nav,
+            page,
             html.Br(),
             dcc.Slider(id="time-slider", min=0, max=10, step=1, value=0),
         ],
     )
+
 
 
 
@@ -184,12 +177,26 @@ app.layout = html.Div(
         # Hidden stores ----------------------------------------------
         dcc.Store(id="paths-json"),  # trajectoires simulées
         dcc.Store(id="orders-json", data=[]),  # ordre book
+        dcc.Store(id="page-idx", data=0),
     ],
 )
 
-# ----------------------------------------------------------------------------
-# Callbacks – SIMULATE (regeneration) ----------------------------------------
-# ----------------------------------------------------------------------------
+@app.callback(
+    Output("page-idx", "data", allow_duplicate=True),
+    Input("btn-prev", "n_clicks"),
+    Input("btn-next", "n_clicks"),
+    State("page-idx", "data"),
+    prevent_initial_call=True,
+)
+def turn_page(prev, nxt, idx):
+    triggered = ctx.triggered_id
+    if triggered == "btn-prev":
+        idx = (idx - 1) % 3
+    elif triggered == "btn-next":
+        idx = (idx + 1) % 3
+    return idx
+
+
 @app.callback(
     Output("paths-json", "data"),
     Output("orders-json", "data"),
@@ -210,9 +217,6 @@ def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, t
     paths_json = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in paths.items()}
     return paths_json, [], int(Nc), 0
 
-# ----------------------------------------------------------------------------
-# Callbacks – ORDERS (add / remove / reset) ----------------------------------
-# ----------------------------------------------------------------------------
 @app.callback(
     Output("orders-json", "data", allow_duplicate=True),
     Input("btn-add", "n_clicks"),
@@ -275,22 +279,16 @@ import pandas as pd
 
 
 @app.callback(
-    Output("graph-paths", "figure"),
-    Output("graph-pnl",   "figure"),
-    Output("graph-delta", "figure"),
-    Output("graph-gamma", "figure"),
-    Output("graph-vega",  "figure"),
-    Output("graph-theta","figure"),
-    Output("graph-rho",   "figure"),
+    Output("page-content", "children"),
     Output("table-positions", "data"),
     Output("table-positions", "columns"),
     Input("time-slider", "value"),
     Input("paths-json",  "data"),
     Input("orders-json", "data"),
+    Input("page-idx",    "data"),      # ← page-idx devient un INPUT
     prevent_initial_call=True,
 )
-
-def update_view(idx: int, paths_json: dict | None, orders: list | None):
+def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx: int):
     if not paths_json:
         raise dash.exceptions.PreventUpdate
 
@@ -341,12 +339,37 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None):
 
     # ---------- 4) Tableau des positions ----------
     snapshot_df = portfolio.state_at(idx)
-    if snapshot_df.empty:
-        return fig_paths, fig_pnl, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, [], []
-
     table_data = snapshot_df.to_dict("records")
     columns    = [{"name": c, "id": c} for c in snapshot_df.columns]
-    return fig_paths, fig_pnl, fig_delta, fig_gamma, fig_vega, fig_theta, fig_rho, table_data, columns
+
+    # ---------- 5) Choix du contenu de page ----------
+    if page_idx == 0:
+        content = dcc.Graph(figure=fig_paths, style={"height": "500px"})
+    elif page_idx == 1:
+        greeks_grid = html.Div(
+            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"},
+            children=[
+                dcc.Graph(figure=fig_pnl,   style={"height": "230px"}),
+                dcc.Graph(figure=fig_delta, style={"height": "230px"}),
+                dcc.Graph(figure=fig_gamma, style={"height": "230px"}),
+                dcc.Graph(figure=fig_vega,  style={"height": "230px"}),
+                dcc.Graph(figure=fig_theta, style={"height": "230px"}),
+                dcc.Graph(figure=fig_rho,   style={"height": "230px"}),
+            ],
+        )
+        content = greeks_grid
+    else:  # page 2
+        content = dash_table.DataTable(
+            data=table_data,
+            columns=columns,
+            page_size=15,
+            style_table={"overflowX": "auto"},
+            style_cell={"textAlign": "right"},
+        )
+
+    return content, table_data, columns
+
+
 
 
 # ----------------------------------------------------------------------------
