@@ -9,18 +9,16 @@
 
 Tous les états sont stockés via dcc.Store afin que l’interface reste réactive.
 """
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import plotly.express as px
+import numpy as np
+import pandas as pd
+from __future__ import annotations  # noqa: F404
 
-from __future__ import annotations
-
-import json
-from typing import List, Dict, Any
 
 import dash
 from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 
 
 from simulation.correlated_paths import generate_paths, PathParams
@@ -36,9 +34,8 @@ server = app.server
 # Layout helpers
 # ----------------------------------------------------------------------------
 
-from dash import dcc, html, dash_table   # vérifie que dash_table est bien importé
 
-import math
+import math  # noqa: E402
 
 def _N(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -317,11 +314,6 @@ def reset_orders_callback(_):
 # ------------------------------------------------------------------
 # UPDATE VIEW  (slider / paths / orders)
 # ------------------------------------------------------------------
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
-import plotly.express as px
-import numpy as np
-import pandas as pd
 
 
 @app.callback(
