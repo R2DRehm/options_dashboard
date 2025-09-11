@@ -10,21 +10,12 @@ Dépendances :
 """
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 from typing import List
 
 import numpy as np
 import pandas as pd
 
-from options.option_pricing import (
-    bs_price,
-    bs_delta,
-    bs_gamma,
-    bs_vega,
-    bs_theta,
-    bs_rho,
-)
 
 
 def _maturity_remaining(T0: float, t_current: float) -> float:
@@ -34,13 +25,14 @@ def _maturity_remaining(T0: float, t_current: float) -> float:
 
 @dataclass
 class OptionOrder:
-    """Représente un ordre passé à un snapshot discret."""
-
-    time_idx: int  # indice dans coarse grid
-    option_type: str  # "call" | "put"
+    """Ordre exécuté au snapshot time_idx."""
+    time_idx: int                  # indice sur le coarse grid
+    option_type: str               # "underlying" | "call" | "put"
     strike: float
-    quantity: float  # nb contrats (+ long, − short)
-    maturity: float  # constante en années depuis t=0
+    quantity: float                # + long / − short
+    maturity: float                # maturité absolue (années depuis t=0)
+    entry_price: float | None = None  # prix par unité au moment de l’exécution
+
 
 
 class Portfolio:
@@ -49,6 +41,17 @@ class Portfolio:
     def __init__(self, path_dict: dict[str, np.ndarray]):
         self.path = path_dict  # dict retourné par generate_paths
         self.orders: List[OptionOrder] = []
+
+    def _snapshot_params(self, idx: int):
+        j = int(self.path["coarse_idx"][idx])
+        t = float(self.path["t_fine"][j])
+        S = float(self.path["S"][j])
+        r = float(self.path["r"][j])
+        sigma = float(np.sqrt(self.path["V"][j]))
+        return j, t, S, r, sigma
+
+    def _tau(self, T0: float, t_now: float) -> float:
+        return max(T0 - t_now, 0.0)
 
     # ------------------------------------------------------------------
     # Gestion des ordres
@@ -60,76 +63,125 @@ class Portfolio:
     # Valeur + grecques au snapshot courant
     # ------------------------------------------------------------------
     def state_at(self, idx: int) -> pd.DataFrame:
-        """Calcule la valeur et les grecques du portefeuille au snapshot `idx`."""
         if not self.orders:
             return pd.DataFrame()
 
-        t_grid = self.path["t_fine"]
-        coarse_idx = self.path["coarse_idx"]
-        # index fin correspondant au coarse snapshot
-        j = coarse_idx[idx]
-        t_now = t_grid[j]
-        S = self.path["S"][j]
-        r = self.path["r"][j]
-        sigma = np.sqrt(self.path["V"][j])
+        _, t_now, S, r, sigma = self._snapshot_params(idx)
+        rows = []
 
-        records = []
-        for order in self.orders:
-            if order.time_idx > idx:
-                # ordre pas encore actif
+        for n, od in enumerate(self.orders):
+            if od.time_idx > idx:
                 continue
 
-                        # ----- Sous-jacent simple -----
-            if order.option_type == "underlying":
-                price = S * order.quantity
-                records.append({
-                    "option_type": "Underlying",
-                    "strike": "-",
-                    "qty": order.quantity,
-                    "price": price,
-                    "delta": order.quantity,  # Δ = 1
-                    "gamma": 0.0,
-                    "vega":  0.0,
-                    "theta": 0.0,
-                    "rho":   0.0,
-                })
-                continue  # passe au prochain ordre
+            # prix et grecques "par unité"
+            if od.option_type == "underlying":
+                mtm_unit = S
+                greeks_unit = {"delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
+            else:
+                tau = self._tau(od.maturity, t_now)
+                from options.option_pricing import instrument_price_and_greeks
+                pg = instrument_price_and_greeks(od.option_type, S, od.strike, tau, r, sigma)
+                mtm_unit = float(pg["price"])
+                greeks_unit = {k: float(pg[k]) for k in ["delta", "gamma", "vega", "theta", "rho"]}
 
+            entry_price = od.entry_price
+            # fallback si pas stocké : valorise au snapshot d’exécution
+            if entry_price is None:
+                _, t_exec, Sx, rx, sigx = self._snapshot_params(od.time_idx)
+                if od.option_type == "underlying":
+                    entry_price = Sx
+                else:
+                    from options.option_pricing import instrument_price
+                    entry_price = float(instrument_price(od.option_type, Sx, od.strike, self._tau(od.maturity, t_exec), rx, sigx))
 
-            tau = _maturity_remaining(order.maturity, t_now)
-            price = bs_price(S, order.strike, tau, r, sigma, order.option_type)
-            delta = bs_delta(S, order.strike, tau, r, sigma, order.option_type)
-            gamma = bs_gamma(S, order.strike, tau, r, sigma)
-            vega = bs_vega(S, order.strike, tau, r, sigma)
-            theta = bs_theta(S, order.strike, tau, r, sigma, order.option_type)
-            rho = bs_rho(S, order.strike, tau, r, sigma, order.option_type)
+            qty = float(od.quantity)
+            cur_value = qty * mtm_unit
+            uPnL = qty * (mtm_unit - float(entry_price))
 
-            records.append({
-                "option_type": order.option_type,
-                "strike": order.strike,
-                "qty": order.quantity,
-                "price": price * order.quantity,
-                "delta": delta * order.quantity,
-                "gamma": gamma * order.quantity,
-                "vega": vega * order.quantity,
-                "theta": theta * order.quantity,
-                "rho": rho * order.quantity,
+            rows.append({
+                "id": n,
+                "option_type": od.option_type,
+                "strike": od.strike if od.option_type != "underlying" else "-",
+                "qty": qty,
+                "entry_idx": od.time_idx,
+                "entry_price": entry_price,
+                "mtm_price": mtm_unit,
+                "value": cur_value,
+                "uPnL": uPnL,
+                "delta": qty * greeks_unit["delta"],
+                "gamma": qty * greeks_unit["gamma"],
+                "vega":  qty * greeks_unit["vega"],
+                "theta": qty * greeks_unit["theta"],
+                "rho":   qty * greeks_unit["rho"],
+                "maturity": od.maturity if od.option_type != "underlying" else "-",
             })
 
-        if not records:
+        if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(records)
-        totals = df[["price", "delta", "gamma", "vega", "theta", "rho"]].sum()
+        df = pd.DataFrame(rows)
+        totals = df[["value","uPnL","delta","gamma","vega","theta","rho"]].sum()
+        totals["id"] = "TOTAL"
         totals["option_type"] = "TOTAL"
         totals["strike"] = "-"
         totals["qty"] = df["qty"].sum()
+        totals["entry_idx"] = ""
+        totals["entry_price"] = ""
+        totals["mtm_price"] = ""
+        totals["maturity"] = ""
         df_tot = pd.concat([df, totals.to_frame().T], ignore_index=True)
-        return df_tot
+
+        # Ordonner les colonnes pour l’affichage
+        col_order = ["id","option_type","qty","strike","maturity","entry_idx",
+                    "entry_price","mtm_price","value","uPnL",
+                    "delta","gamma","vega","theta","rho"]
+        return df_tot[col_order]
+
 
     # ------------------------------------------------------------------
     # Helpers pour grecs/PnL time series (pour les graphiques)
     # ------------------------------------------------------------------
+
+    def cash_series(self) -> np.ndarray:
+        """Cash(t) = cumul des flux d'exécution (− qty * entry_price) au fil des snapshots."""
+        Nc = len(self.path["coarse_idx"])
+        cf = np.zeros(Nc)
+        if not self.orders:
+            return cf
+        for od in self.orders:
+            k0 = int(od.time_idx)
+            # entry_price fallback si absent
+            ep = od.entry_price
+            if ep is None:
+                _, t_exec, Sx, rx, sigx = self._snapshot_params(k0)
+                if od.option_type == "underlying":
+                    ep = Sx
+                else:
+                    from options.option_pricing import instrument_price
+                    ep = float(instrument_price(od.option_type, Sx, od.strike, self._tau(od.maturity, t_exec), rx, sigx))
+            cf[k0] += - float(od.quantity) * float(ep)
+        return np.cumsum(cf)
+
+    def mtm_series(self) -> np.ndarray:
+        """MtM agrégé du portefeuille sur les snapshots."""
+        Nc = len(self.path["coarse_idx"])
+        mtm = np.zeros(Nc)
+        for k in range(Nc):
+            st = self.state_at(k)
+            if st.empty:
+                continue
+            mtm[k] = float(st.iloc[-1]["value"])  # TOTAL.value
+        return mtm
+
+    def pnl_over_time(self) -> pd.DataFrame:
+        """DataFrame idx, cash, mtm, equity, pnl."""
+        idxs = np.arange(len(self.path["coarse_idx"]))
+        cash = self.cash_series()
+        mtm  = self.mtm_series()
+        equity = cash + mtm
+        pnl = equity - equity[0]  # Equity(0)=0 en général
+        return pd.DataFrame({"idx": idxs, "cash": cash, "mtm": mtm, "equity": equity, "pnl": pnl})
+
     def greeks_over_time(self) -> pd.DataFrame:
         """Calcule la série temporelle agrégée des grecques du portefeuille."""
         coarse_len = len(self.path["coarse_idx"])

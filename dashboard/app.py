@@ -13,7 +13,6 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import plotly.express as px
 import numpy as np
-import pandas as pd
 from __future__ import annotations  # noqa: F404
 
 
@@ -23,6 +22,7 @@ from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx
 
 from simulation.correlated_paths import generate_paths, PathParams
 from portfolio.portfolio import Portfolio, OptionOrder
+from options.option_pricing import instrument_price 
 
 # ----------------------------------------------------------------------------
 # Dash app initialisation
@@ -259,26 +259,28 @@ def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, t
     State("strike", "value"),
     State("qty", "value"),
     State("maturity", "value"),
-    State("paths-json", "data"),         
+    State("paths-json", "data"),   
     prevent_initial_call=True,
 )
 def add_order_callback(_, orders, idx, instr, strike, qty, maturity, paths_json):
     if orders is None:
         orders = []
-    # reconstituer le path numpy
     path = {k: np.array(v) if isinstance(v, list) else v for k, v in (paths_json or {}).items()}
-    # prix d’entrée au snapshot courant
-    entry_price = price_of_order_at_idx(path, {
-        "option_type": instr, "strike": strike or 0.0, "maturity": maturity or 0.0
-    }, int(idx))
+    j = int(path["coarse_idx"][int(idx)])
+    t = float(path["t_fine"][j])
+    S = float(path["S"][j])
+    r = float(path["r"][j])
+    sigma = float(np.sqrt(path["V"][j]))
+    tau = max((maturity or 0.0) - t, 0.0)
+    entry_price = S if instr == "underlying" else float(instrument_price(instr, S, float(strike or 0.0), tau, r, sigma))
 
     orders.append({
         "time_idx": int(idx),
         "option_type": instr,
-        "strike": strike or 0.0,
-        "quantity": qty,
-        "maturity": maturity or 0.0,
-        "entry_price": float(entry_price),   # <<< stocké pour CASH
+        "strike": float(strike or 0.0),
+        "quantity": float(qty or 0.0),
+        "maturity": float(maturity or 0.0),
+        "entry_price": float(entry_price),
     })
     return orders
 
@@ -315,7 +317,6 @@ def reset_orders_callback(_):
 # UPDATE VIEW  (slider / paths / orders)
 # ------------------------------------------------------------------
 
-
 @app.callback(
     Output("page-content", "children"),
     Output("table-positions", "data"),
@@ -323,7 +324,7 @@ def reset_orders_callback(_):
     Input("time-slider", "value"),
     Input("paths-json",  "data"),
     Input("orders-json", "data"),
-    Input("page-idx",    "data"),      # ← page-idx devient un INPUT
+    Input("page-idx",    "data"),
     prevent_initial_call=True,
 )
 def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx: int):
@@ -333,9 +334,9 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     # ---------- 1) Reconstituer la trajectoire ----------
     path = {k: np.array(v) if isinstance(v, list) else v for k, v in paths_json.items()}
 
-    # Snapshot courant
-    j      = int(path["coarse_idx"][idx])
-    t_now  = path["t_fine"][j]
+    # Snapshot courant (pour la ligne verticale)
+    j     = int(path["coarse_idx"][idx])
+    t_now = float(path["t_fine"][j])
 
     # ---------- 2) Graphe Spot / σ / r (axes distincts) ----------
     fig_paths = make_subplots(specs=[[{"secondary_y": True}]])
@@ -343,64 +344,30 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=np.sqrt(path["V"]), name="σ"),    secondary_y=True)
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=path["r"],          name="r"),    secondary_y=True)
     fig_paths.add_vline(x=t_now, line_width=1, line_dash="dot", line_color="black")
-    fig_paths.update_layout(
-        title="Spot / σ / r – full path",
-        height=320,  # Hauteur alignée sur le CSS du main_panel()
-    )
+    fig_paths.update_layout(title="Spot / σ / r – full path", height=320)
 
-
-    # ---------- 3) Construire le portefeuille ----------
+    # ---------- 3) Construire le portefeuille (avec entry_price) ----------
     portfolio = Portfolio(path)
-
-    # Seules les clés acceptées par OptionOrder
-    _ALLOWED = {"time_idx", "option_type", "strike", "quantity", "maturity"}
-
     for od in (orders or []):
-        od_clean = {k: od.get(k) for k in _ALLOWED if k in od}
-        # cast défensif (au cas où JSON renvoie None)
-        od_clean["time_idx"] = int(od_clean.get("time_idx", 0))
-        od_clean["strike"]   = float(od_clean.get("strike", 0.0) or 0.0)
-        od_clean["quantity"] = float(od_clean.get("quantity", 0.0) or 0.0)
-        od_clean["maturity"] = float(od_clean.get("maturity", 0.0) or 0.0)
-        portfolio.add_order(OptionOrder(**od_clean))
+        portfolio.add_order(OptionOrder(
+            time_idx=int(od.get("time_idx", 0)),
+            option_type=od.get("option_type", "call"),
+            strike=float(od.get("strike", 0.0) or 0.0),
+            quantity=float(od.get("quantity", 0.0) or 0.0),
+            maturity=float(od.get("maturity", 0.0) or 0.0),
+            entry_price=(float(od["entry_price"]) if od.get("entry_price") is not None else None),
+        ))
 
-
+    # Série des grecques agrégées pour les graphes
     greeks_df = portfolio.greeks_over_time()
 
-    # ----- Equity / Cash / MtM / PnL over time -----
-    Nc = len(path["coarse_idx"])
-    idxs = np.arange(Nc)
-
-    # MtM(t): somme des valeurs courantes des positions
-    mtm = np.zeros(Nc)
-    for k in range(Nc):
-        v = 0.0
-        for od in (orders or []):
-            v += (float(od["quantity"]) * price_of_order_at_idx(path, od, k))
-        mtm[k] = v
-
-    # Cash(t): somme des cashflows de trades déjà passés (prix d’entrée * quantité, signe d’achat/vente)
-    # Convention: achat qty>0 => cash sortant => - qty * entry_price
-    cash = np.zeros(Nc)
-    if orders:
-        # cashflow par ordre à la date d’exécution
-        cf = np.zeros(Nc)
-        for od in orders:
-            k0 = int(od["time_idx"])
-            ep = float(od.get("entry_price") or price_of_order_at_idx(path, od, k0))
-            cf[k0] += - float(od["quantity"]) * ep
-        cash = np.cumsum(cf)
-
-    equity = mtm + cash
-    pnl_series = equity  # Equity(0)=0 ici; sinon soustraire equity[0]
-    pnl_df = pd.DataFrame({"idx": idxs, "pnl": pnl_series})
-
+    # ----- PnL over time (cash + MtM) via le moteur de portefeuille -----
+    pnl_df = portfolio.pnl_over_time()
     fig_pnl = px.line(pnl_df, x="idx", y="pnl", title="Portfolio PnL vs snapshot")
     fig_pnl.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
     fig_pnl.update_layout(height=230, margin=dict(l=50, r=20, t=30, b=20))
 
-
-    # Helper pour chaque grecque
+    # Helper pour chaque grecque (agrégée portefeuille)
     def greek_fig(column: str, title: str):
         fig = px.line(greeks_df, x="idx", y=column, title=title)
         fig.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
@@ -413,26 +380,8 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     fig_theta = greek_fig("theta",  "Theta")
     fig_rho   = greek_fig("rho",    "Rho")
 
-    # ---------- 4) Tableau des positions ----------
-    rows = []
-    for n, od in enumerate(orders or []):
-        entry_idx = int(od["time_idx"])
-        entry_price = float(od.get("entry_price") or price_of_order_at_idx(path, od, entry_idx))
-        cur_price = float(price_of_order_at_idx(path, od, idx))
-        qty = float(od["quantity"])
-        rows.append({
-            "id": n,
-            "type": od["option_type"],
-            "qty": qty,
-            "strike": od.get("strike", ""),
-            "maturity": od.get("maturity", ""),
-            "entry_idx": entry_idx,
-            "entry_price": round(entry_price, 6),
-            "mtm_price": round(cur_price, 6),
-            "value": round(qty * cur_price, 6),
-            "uPnL": round(qty * (cur_price - entry_price), 6),
-        })
-    snapshot_df = pd.DataFrame(rows)
+    # ---------- 4) Tableau des positions (Entry/MtM/uPnL + Greeks + TOTAL) ----------
+    snapshot_df = portfolio.state_at(idx)  # renvoie déjà la ligne TOTAL et l’ordre des colonnes
     table_data = snapshot_df.to_dict("records")
     columns = [{"name": c, "id": c} for c in snapshot_df.columns]
 
@@ -452,13 +401,20 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
             ],
         )
         content = greeks_grid
-    else:  # page 2
+    else:  # page 2 : tableau détaillé
         content = dash_table.DataTable(
             data=table_data,
             columns=columns,
             page_size=15,
             style_table={"overflowX": "auto"},
             style_cell={"textAlign": "right"},
+            style_data_conditional=[
+                {  # met en évidence la ligne TOTAL
+                    "if": {"filter_query": "{option_type} = 'TOTAL'"},
+                    "fontWeight": "bold",
+                    "backgroundColor": "#f5f5f5",
+                }
+            ],
         )
 
     return content, table_data, columns

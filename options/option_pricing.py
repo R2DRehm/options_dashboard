@@ -139,3 +139,28 @@ def bs_rho(
         return K * T * np.exp(-r * T) * norm.cdf(D2)
     else:
         return - K * T * np.exp(-r * T) * norm.cdf(-D2)
+
+# --- Helpers orientés "instrument" (sous-jacent vs option) -------------------
+
+def instrument_price(option_type: str, S: float, K: float, T: float, r: float, sigma: float) -> float:
+    option_type = option_type.lower()
+    if option_type == "underlying":
+        return S
+    return bs_price(S, K, T, r, sigma, option_type)
+
+def instrument_greeks(option_type: str, S: float, K: float, T: float, r: float, sigma: float) -> dict:
+    option_type = option_type.lower()
+    if option_type == "underlying":
+        return {"delta": 1.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
+    return {
+        "delta": bs_delta(S, K, T, r, sigma, option_type),
+        "gamma": bs_gamma(S, K, T, r, sigma),
+        "vega":  bs_vega(S, K, T, r, sigma),
+        "theta": bs_theta(S, K, T, r, sigma, option_type),
+        "rho":   bs_rho(S, K, T, r, sigma, option_type),
+    }
+
+def instrument_price_and_greeks(option_type: str, S: float, K: float, T: float, r: float, sigma: float) -> dict:
+    price = instrument_price(option_type, S, K, T, r, sigma)
+    g = instrument_greeks(option_type, S, K, T, r, sigma)
+    return {"price": price, **g}
