@@ -38,10 +38,46 @@ server = app.server
 
 from dash import dcc, html, dash_table   # vérifie que dash_table est bien importé
 
+import math
+
+def _N(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_price(is_call: bool, S: float, K: float, r: float, sigma: float, tau: float) -> float:
+    """Black–Scholes européen; gère tau<=0 et sigma<=0 (valeur intrinsèque)."""
+    tau = max(tau, 0.0)
+    if tau == 0.0 or sigma <= 0.0:
+        intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+        return intrinsic
+    sqrt_tau = math.sqrt(tau)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau)
+    d2 = d1 - sigma * sqrt_tau
+    if is_call:
+        return S * _N(d1) - K * math.exp(-r * tau) * _N(d2)
+    else:
+        return K * math.exp(-r * tau) * _N(-d2) - S * _N(-d1)
+
+def price_of_order_at_idx(path: dict, od: dict, idx_snap: int) -> float:
+    """Prix (par unité) d’un ordre au snapshot idx_snap (0..Nc-1) à partir de path."""
+    j = int(path["coarse_idx"][idx_snap])
+    t = float(path["t_fine"][j])
+    S = float(path["S"][j])
+    r = float(path["r"][j])
+    sigma = float(np.sqrt(path["V"][j]))
+    typ = od["option_type"]
+    if typ == "underlying":
+        return S
+    elif typ in ("call", "put"):
+        tau = max((od.get("maturity") or 0.0) - t, 0.0)
+        return bs_price(typ == "call", S, float(od.get("strike") or 0.0), r, sigma, tau)
+    else:
+        return 0.0
+
+
 def sidebar() -> html.Div:
     """Left panel: simulation params + order form + portfolio table."""
     return html.Div(
-        style={"width": "10%", "padding": "15px",
+        style={"width": "20%", "padding": "15px",
                "overflowY": "auto", "background": "#f1f3f4"},
         children=[
             html.H3("Simulation"),
@@ -157,7 +193,7 @@ def main_panel() -> html.Div:
     page = html.Div(id="page-content")
 
     return html.Div(
-        style={"width": "90%", "padding": "15px"},
+        style={"width": "80%", "padding": "15px"},
         children=[
             nav,
             page,
@@ -222,23 +258,33 @@ def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, t
     Input("btn-add", "n_clicks"),
     State("orders-json", "data"),
     State("time-slider", "value"),
-    State("instr-type", "value"),  
+    State("instr-type", "value"),
     State("strike", "value"),
     State("qty", "value"),
     State("maturity", "value"),
+    State("paths-json", "data"),         
     prevent_initial_call=True,
 )
-def add_order_callback(_, orders, idx, instr, strike, qty, maturity):
+def add_order_callback(_, orders, idx, instr, strike, qty, maturity, paths_json):
     if orders is None:
         orders = []
+    # reconstituer le path numpy
+    path = {k: np.array(v) if isinstance(v, list) else v for k, v in (paths_json or {}).items()}
+    # prix d’entrée au snapshot courant
+    entry_price = price_of_order_at_idx(path, {
+        "option_type": instr, "strike": strike or 0.0, "maturity": maturity or 0.0
+    }, int(idx))
+
     orders.append({
         "time_idx": int(idx),
-        "option_type": instr,    
+        "option_type": instr,
         "strike": strike or 0.0,
         "quantity": qty,
-        "maturity": maturity or 0.0
+        "maturity": maturity or 0.0,
+        "entry_price": float(entry_price),   # <<< stocké pour CASH
     })
     return orders
+
 
 
 
@@ -313,16 +359,54 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
 
     # ---------- 3) Construire le portefeuille ----------
     portfolio = Portfolio(path)
-    for od in orders or []:
-        portfolio.add_order(OptionOrder(**od))
+
+    # Seules les clés acceptées par OptionOrder
+    _ALLOWED = {"time_idx", "option_type", "strike", "quantity", "maturity"}
+
+    for od in (orders or []):
+        od_clean = {k: od.get(k) for k in _ALLOWED if k in od}
+        # cast défensif (au cas où JSON renvoie None)
+        od_clean["time_idx"] = int(od_clean.get("time_idx", 0))
+        od_clean["strike"]   = float(od_clean.get("strike", 0.0) or 0.0)
+        od_clean["quantity"] = float(od_clean.get("quantity", 0.0) or 0.0)
+        od_clean["maturity"] = float(od_clean.get("maturity", 0.0) or 0.0)
+        portfolio.add_order(OptionOrder(**od_clean))
+
 
     greeks_df = portfolio.greeks_over_time()
 
-    # ----- PnL over time -----
-    pnl_df = greeks_df[['idx','price']].rename(columns={'price':'pnl'})
-    fig_pnl = px.line(pnl_df, x='idx', y='pnl', title='Portfolio PnL vs snapshot')
-    fig_pnl.add_vline(x=idx, line_width=1, line_dash='dot', line_color='black')
+    # ----- Equity / Cash / MtM / PnL over time -----
+    Nc = len(path["coarse_idx"])
+    idxs = np.arange(Nc)
+
+    # MtM(t): somme des valeurs courantes des positions
+    mtm = np.zeros(Nc)
+    for k in range(Nc):
+        v = 0.0
+        for od in (orders or []):
+            v += (float(od["quantity"]) * price_of_order_at_idx(path, od, k))
+        mtm[k] = v
+
+    # Cash(t): somme des cashflows de trades déjà passés (prix d’entrée * quantité, signe d’achat/vente)
+    # Convention: achat qty>0 => cash sortant => - qty * entry_price
+    cash = np.zeros(Nc)
+    if orders:
+        # cashflow par ordre à la date d’exécution
+        cf = np.zeros(Nc)
+        for od in orders:
+            k0 = int(od["time_idx"])
+            ep = float(od.get("entry_price") or price_of_order_at_idx(path, od, k0))
+            cf[k0] += - float(od["quantity"]) * ep
+        cash = np.cumsum(cf)
+
+    equity = mtm + cash
+    pnl_series = equity  # Equity(0)=0 ici; sinon soustraire equity[0]
+    pnl_df = pd.DataFrame({"idx": idxs, "pnl": pnl_series})
+
+    fig_pnl = px.line(pnl_df, x="idx", y="pnl", title="Portfolio PnL vs snapshot")
+    fig_pnl.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
     fig_pnl.update_layout(height=230, margin=dict(l=50, r=20, t=30, b=20))
+
 
     # Helper pour chaque grecque
     def greek_fig(column: str, title: str):
@@ -338,9 +422,27 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     fig_rho   = greek_fig("rho",    "Rho")
 
     # ---------- 4) Tableau des positions ----------
-    snapshot_df = portfolio.state_at(idx)
+    rows = []
+    for n, od in enumerate(orders or []):
+        entry_idx = int(od["time_idx"])
+        entry_price = float(od.get("entry_price") or price_of_order_at_idx(path, od, entry_idx))
+        cur_price = float(price_of_order_at_idx(path, od, idx))
+        qty = float(od["quantity"])
+        rows.append({
+            "id": n,
+            "type": od["option_type"],
+            "qty": qty,
+            "strike": od.get("strike", ""),
+            "maturity": od.get("maturity", ""),
+            "entry_idx": entry_idx,
+            "entry_price": round(entry_price, 6),
+            "mtm_price": round(cur_price, 6),
+            "value": round(qty * cur_price, 6),
+            "uPnL": round(qty * (cur_price - entry_price), 6),
+        })
+    snapshot_df = pd.DataFrame(rows)
     table_data = snapshot_df.to_dict("records")
-    columns    = [{"name": c, "id": c} for c in snapshot_df.columns]
+    columns = [{"name": c, "id": c} for c in snapshot_df.columns]
 
     # ---------- 5) Choix du contenu de page ----------
     if page_idx == 0:
