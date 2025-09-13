@@ -48,76 +48,54 @@ def generate_paths(
     N_coarse: int,
     seed: int | None = None,
 ) -> dict[str, NDArray]:
-    """Simule des trajectoires corrélées (S, V, r).
-
-    Parameters
-    ----------
-    S0, V0, r0 : float
-        Valeurs initiales pour le spot, la variance (≃ σ²) et le taux court.
-    params : PathParams
-        Regroupe tous les paramètres de dynamique.
-    T : float
-        Horizon en années.
-    N_fine : int
-        Nombre de pas de temps fins pour la simulation.
-    N_coarse : int
-        Nombre de points où l’utilisateur peut intervenir (slider).
-    seed : int | None
-        Graine RNG.
-    """
-    if seed is not None:
-        np.random.seed(seed)
+    """Simule des trajectoires corrélées (S, V, r)."""
+    rng = np.random.default_rng(seed)  # <- RNG local, seed=None => aléa frais
 
     dt = T / N_fine
+    sqrt_dt = np.sqrt(dt)
 
-    # Matrice de corrélation (prix/vol)
+    # Corrélation (prix/vol)
     cov = np.array([[1.0, params.rho], [params.rho, 1.0]])
-    L = np.linalg.cholesky(cov)  # Cholesky pour corrélation
+    L = np.linalg.cholesky(cov)
 
-    # Pré‑allocation
+    # Pré-allocation
     S = np.empty(N_fine + 1)
     V = np.empty(N_fine + 1)
     r = np.empty(N_fine + 1)
     S[0], V[0], r[0] = S0, V0, r0
 
-    for t in range(N_fine):
-        # 2 BMs corrélés pour (S, V) + 1 BM indépendant (r)
-        z = np.random.normal(size=3)
-        dW_price, dW_vol = L @ z[:2]
-        dW_rate = z[2]
+    # Tirages normaux (corrélés pour S/V, indépendants pour r)
+    Z = rng.standard_normal((N_fine, 3))  # (z1,z2) pour S/V, z3 pour r
 
-        # Vol process (OU on variance)
-        V[t + 1] = (
+    for t in range(N_fine):
+        dW_pv = L @ Z[t, :2]
+        dW_price, dW_vol = dW_pv[0], dW_pv[1]
+        dW_rate = Z[t, 2]
+
+        # Vol (OU sur variance, type Heston-lite)
+        V_next = (
             V[t]
             + params.kappa_v * (params.theta_v - V[t]) * dt
-            + params.xi * np.sqrt(max(V[t], 0)) * np.sqrt(dt) * dW_vol
+            + params.xi * np.sqrt(max(V[t], 0.0)) * sqrt_dt * dW_vol
         )
-        V[t + 1] = max(V[t + 1], 1e-10)  # évite négativité
+        V[t + 1] = max(V_next, 1e-10)
 
-        # Spot GBM avec variance instantanée V
+        # Spot GBM
         sigma_inst = np.sqrt(V[t])
-        S[t + 1] = S[t] * np.exp(
-            (params.mu - 0.5 * sigma_inst**2) * dt + sigma_inst * np.sqrt(dt) * dW_price
-        )
+        S[t + 1] = S[t] * np.exp((params.mu - 0.5 * sigma_inst**2) * dt + sigma_inst * sqrt_dt * dW_price)
 
-        # Rate Vasicek
+        # Taux (Vasicek)
         r[t + 1] = (
             r[t]
             + params.kappa_r * (params.theta_r - r[t]) * dt
-            + params.sigma_r * np.sqrt(dt) * dW_rate
+            + params.sigma_r * sqrt_dt * dW_rate
         )
 
-    # Mailles de temps
     t_fine = np.linspace(0.0, T, N_fine + 1)
     coarse_idx = np.linspace(0, N_fine, N_coarse + 1, dtype=int)
 
-    return {
-        "t_fine": t_fine,  # shape (N_fine+1,)
-        "coarse_idx": coarse_idx,  # shape (N_coarse+1,)
-        "S": S,  # (N_fine+1,)
-        "V": V,  # (N_fine+1,)
-        "r": r,  # (N_fine+1,)
-    }
+    return {"t_fine": t_fine, "coarse_idx": coarse_idx, "S": S, "V": V, "r": r}
+
 
 
 __all__ = ["PathParams", "generate_paths"]

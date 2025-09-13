@@ -183,14 +183,31 @@ class Portfolio:
         return pd.DataFrame({"idx": idxs, "cash": cash, "mtm": mtm, "equity": equity, "pnl": pnl})
 
     def greeks_over_time(self) -> pd.DataFrame:
-        """Calcule la série temporelle agrégée des grecques du portefeuille."""
+        """Série temporelle agrégée des grecques du portefeuille (TOTAL).
+        Expose à la fois 'value' (nouveau) et 'price' (alias compat rétro)."""
         coarse_len = len(self.path["coarse_idx"])
         rows = []
         for idx in range(coarse_len):
             st = self.state_at(idx)
             if st.empty:
-                rows.append({"idx": idx, "price": 0, "delta": 0, "gamma": 0, "vega": 0, "theta": 0, "rho": 0})
+                rows.append({
+                    "idx": idx,
+                    "value": 0.0,
+                    "price": 0.0,   # alias compat
+                    "delta": 0.0, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0
+                })
             else:
-                tot = st.iloc[-1]  # dernière ligne = TOTAL
-                rows.append({"idx": idx, **tot[["price", "delta", "gamma", "vega", "theta", "rho"]]})
+                tot = st.iloc[-1]  # ligne TOTAL
+                v = float(tot.get("value", tot.get("price", 0.0)))
+                rows.append({
+                    "idx": idx,
+                    "value": v,
+                    "price": v,     # alias compat pour ancien code
+                    "delta": float(tot.get("delta", 0.0)),
+                    "gamma": float(tot.get("gamma", 0.0)),
+                    "vega":  float(tot.get("vega",  0.0)),
+                    "theta": float(tot.get("theta", 0.0)),
+                    "rho":   float(tot.get("rho",   0.0)),
+                })
         return pd.DataFrame(rows)
+

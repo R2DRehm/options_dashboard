@@ -9,18 +9,20 @@
 
 Tous les états sont stockés via dcc.Store afin que l’interface reste réactive.
 """
+from __future__ import annotations  # noqa: F404
+
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import plotly.express as px
 import numpy as np
-from __future__ import annotations  # noqa: F404
+import pandas as pd
 
 
 import dash
 from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx
 
 
-from simulation.correlated_paths import generate_paths, PathParams
+from simulation.vol_rates_simulation import generate_paths_heston2f, generate_paths_garch
 from portfolio.portfolio import Portfolio, OptionOrder
 from options.option_pricing import instrument_price 
 
@@ -80,9 +82,11 @@ def sidebar() -> html.Div:
             html.H3("Simulation"),
             html.Label("S0"),
             dcc.Input(id="s0", type="number", value=100, step=1),
+            html.Br(),
 
             html.Label("V0 (σ²)"),
             dcc.Input(id="v0", type="number", value=0.04, step=0.01),
+            html.Br(),
 
             html.Label("r0"),
             dcc.Input(id="r0", type="number", value=0.01, step=0.001),
@@ -90,12 +94,15 @@ def sidebar() -> html.Div:
 
             html.Label("μ"),
             dcc.Input(id="mu", type="number", value=0.05, step=0.01),
+            html.Br(),
 
             html.Label("κ_v"),
             dcc.Input(id="kappa_v", type="number", value=1.0, step=0.1),
+            html.Br(),
 
             html.Label("θ_v"),
             dcc.Input(id="theta_v", type="number", value=0.04, step=0.01),
+            html.Br(),
 
             html.Label("ξ"),
             dcc.Input(id="xi", type="number", value=0.2, step=0.01),
@@ -103,9 +110,11 @@ def sidebar() -> html.Div:
 
             html.Label("κ_r"),
             dcc.Input(id="kappa_r", type="number", value=0.5, step=0.1),
+            html.Br(),
 
             html.Label("θ_r"),
             dcc.Input(id="theta_r", type="number", value=0.03, step=0.01),
+            html.Br(),
 
             html.Label("σ_r"),
             dcc.Input(id="sigma_r", type="number", value=0.01, step=0.001),
@@ -117,16 +126,30 @@ def sidebar() -> html.Div:
 
             html.Label("T (years)"),
             dcc.Input(id="T", type="number", value=1.0, step=0.1),
+            html.Br(),
 
             html.Label("Fine steps"),
             dcc.Input(id="Nf", type="number", value=2000, step=100),
+            html.Br(),
 
             html.Label("Coarse pts"),
-            dcc.Input(id="Nc", type="number", value=10, step=1),
+            dcc.Input(id="Nc", type="number", value=100, step=1),
             html.Br(),
 
             html.Label("Seed"),
-            dcc.Input(id="seed", type="number", value=42, step=1),
+            dcc.Input(id="seed", type="number", placeholder="(random)", debounce=True),
+            html.Br(),
+
+            html.Label("Vol model"),
+            dcc.Dropdown(
+                id="vol-model",
+                options=[
+                    {"label": "Heston 1-facteur (actuel)", "value": "h1f"},
+                    {"label": "Heston 2-facteurs (clusters)", "value": "h2f"},
+                    {"label": "GARCH(1,1) (fort clustering)", "value": "garch"},
+                ],
+                value="h2f",
+            ),
             html.Br(),
 
             html.Button("Simulate", id="btn-sim", n_clicks=0,
@@ -146,15 +169,18 @@ def sidebar() -> html.Div:
                 ],
                 value="underlying",
             ),
+            html.Br(),
 
             html.Label("Strike"),
             dcc.Input(id="strike", type="number", value=100, step=1),
+            html.Br(),
 
             html.Label("Qty (+ long / − short)"),
-            dcc.Input(id="qty", type="number", value=1, step=0.1),
+            dcc.Input(id="qty", type="number", value=1, step=0.01),
+            html.Br(),
 
             html.Label("Maturity (years)"),
-            dcc.Input(id="maturity", type="number", value=1.0, step=0.1),
+            dcc.Input(id="maturity", type="number", value=1.0, step=0.01),
             html.Br(),
 
             html.Button("Add",   id="btn-add",    n_clicks=0, style={"width": "49%", "marginTop": "8px"}),
@@ -189,13 +215,18 @@ def main_panel() -> html.Div:
     # Container whose children we will swap (graphs or table)
     page = html.Div(id="page-content")
 
+    slider = html.Div(
+        id="time-slider-wrapper",
+        children=[dcc.Slider(id="time-slider", min=0, max=10, step=1, value=0)]
+    )
+
     return html.Div(
         style={"width": "80%", "padding": "15px"},
         children=[
             nav,
             page,
             html.Br(),
-            dcc.Slider(id="time-slider", min=0, max=10, step=1, value=0),
+            slider,   # ← au lieu de mettre directement le Slider
         ],
     )
 
@@ -224,11 +255,10 @@ app.layout = html.Div(
 def turn_page(prev, nxt, idx):
     triggered = ctx.triggered_id
     if triggered == "btn-prev":
-        idx = (idx - 1) % 3
+        idx = (idx - 1) % 2   # ← 2 pages
     elif triggered == "btn-next":
-        idx = (idx + 1) % 3
+        idx = (idx + 1) % 2
     return idx
-
 
 @app.callback(
     Output("paths-json", "data"),
@@ -239,16 +269,23 @@ def turn_page(prev, nxt, idx):
     State("s0", "value"), State("v0", "value"), State("r0", "value"),
     State("mu", "value"), State("kappa_v", "value"), State("theta_v", "value"), State("xi", "value"),
     State("kappa_r", "value"), State("theta_r", "value"), State("sigma_r", "value"),
-    State("rho", "value"), State("T", "value"), State("Nf", "value"), State("Nc", "value"), State("seed", "value"),
+    State("rho", "value"), State("T", "value"), State("Nf", "value"), State("Nc", "value"), State("seed", "value"), State("vol-model","value"),
     prevent_initial_call=True,
 )
-def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, theta_r, sigma_r, rho, T, Nf, Nc, seed):
-    """Regenerate a new path and reset orders + slider."""
-    params = PathParams(mu=mu, kappa_v=kappa_v, theta_v=theta_v, xi=xi, kappa_r=kappa_r, theta_r=theta_r, sigma_r=sigma_r, rho=rho)
-    paths = generate_paths(S0, V0, r0, params, T, int(Nf), int(Nc), seed=int(seed) if seed is not None else None)
-    # JSON-serialisable
-    paths_json = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in paths.items()}
-    return paths_json, [], int(Nc), 0
+def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, theta_r, sigma_r, rho, T, Nf, Nc, seed, vol_model):
+    params = PathParams(mu=mu, kappa_v=kappa_v, theta_v=theta_v, xi=xi,
+                        kappa_r=kappa_r, theta_r=theta_r, sigma_r=sigma_r, rho=rho)
+
+    seed_val = None if seed in (None, "") else int(seed)
+
+    if vol_model == "h2f":
+        paths = generate_paths_heston2f(S0, V0, r0, params, float(T), int(Nf), int(Nc), seed=seed_val)
+    elif vol_model == "garch":
+        paths = generate_paths_garch(S0, V0, r0, params, float(T), int(Nf), int(Nc), seed=seed_val)
+
+    paths_json = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in paths.items()}
+    return paths_json, [], int(Nc) - 1, 0
+
 
 @app.callback(
     Output("orders-json", "data", allow_duplicate=True),
@@ -274,11 +311,12 @@ def add_order_callback(_, orders, idx, instr, strike, qty, maturity, paths_json)
     tau = max((maturity or 0.0) - t, 0.0)
     entry_price = S if instr == "underlying" else float(instrument_price(instr, S, float(strike or 0.0), tau, r, sigma))
 
+    # --- dans add_order_callback()
     orders.append({
         "time_idx": int(idx),
         "option_type": instr,
         "strike": float(strike or 0.0),
-        "quantity": float(qty or 0.0),
+        "quantity": round(float(qty or 0.0), 2),         
         "maturity": float(maturity or 0.0),
         "entry_price": float(entry_price),
     })
@@ -321,6 +359,7 @@ def reset_orders_callback(_):
     Output("page-content", "children"),
     Output("table-positions", "data"),
     Output("table-positions", "columns"),
+    Output("time-slider-wrapper", "style"),
     Input("time-slider", "value"),
     Input("paths-json",  "data"),
     Input("orders-json", "data"),
@@ -331,22 +370,20 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     if not paths_json:
         raise dash.exceptions.PreventUpdate
 
-    # ---------- 1) Reconstituer la trajectoire ----------
+    # ---------- 1) Path ----------
     path = {k: np.array(v) if isinstance(v, list) else v for k, v in paths_json.items()}
-
-    # Snapshot courant (pour la ligne verticale)
     j     = int(path["coarse_idx"][idx])
     t_now = float(path["t_fine"][j])
 
-    # ---------- 2) Graphe Spot / σ / r (axes distincts) ----------
+    # ---------- 2) Trajectoires S / σ / r ----------
     fig_paths = make_subplots(specs=[[{"secondary_y": True}]])
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=path["S"],          name="Spot"), secondary_y=False)
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=np.sqrt(path["V"]), name="σ"),    secondary_y=True)
     fig_paths.add_trace(go.Scatter(x=path["t_fine"], y=path["r"],          name="r"),    secondary_y=True)
     fig_paths.add_vline(x=t_now, line_width=1, line_dash="dot", line_color="black")
-    fig_paths.update_layout(title="Spot / σ / r – full path", height=320)
+    fig_paths.update_layout(title="Spot / σ / r – full path", autosize=True, margin=dict(l=50, r=20, t=30, b=20))
 
-    # ---------- 3) Construire le portefeuille (avec entry_price) ----------
+    # ---------- 3) Portefeuille ----------
     portfolio = Portfolio(path)
     for od in (orders or []):
         portfolio.add_order(OptionOrder(
@@ -358,67 +395,114 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
             entry_price=(float(od["entry_price"]) if od.get("entry_price") is not None else None),
         ))
 
-    # Série des grecques agrégées pour les graphes
     greeks_df = portfolio.greeks_over_time()
 
-    # ----- PnL over time (cash + MtM) via le moteur de portefeuille -----
+    # ----- PnL over time -----
     pnl_df = portfolio.pnl_over_time()
-    fig_pnl = px.line(pnl_df, x="idx", y="pnl", title="Portfolio PnL vs snapshot")
+    def _greek_fig(column: str, title: str):
+        f = px.line(greeks_df, x="idx", y=column, title=title)
+        f.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
+        f.update_layout(autosize=True, margin=dict(l=50, r=20, t=30, b=20))
+        return f
+
+    fig_pnl   = px.line(pnl_df, x="idx", y="pnl", title="Portfolio PnL vs snapshot")
     fig_pnl.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
-    fig_pnl.update_layout(height=230, margin=dict(l=50, r=20, t=30, b=20))
+    fig_pnl.update_layout(autosize=True, margin=dict(l=50, r=20, t=30, b=20))
 
-    # Helper pour chaque grecque (agrégée portefeuille)
-    def greek_fig(column: str, title: str):
-        fig = px.line(greeks_df, x="idx", y=column, title=title)
-        fig.add_vline(x=idx, line_width=1, line_dash="dot", line_color="black")
-        fig.update_layout(height=230, margin=dict(l=50, r=20, t=30, b=20))
-        return fig
+    fig_delta = _greek_fig("delta",  "Δ  (Delta)")
+    fig_gamma = _greek_fig("gamma",  "Γ  (Gamma)")
+    fig_vega  = _greek_fig("vega",   "Vega")
+    fig_theta = _greek_fig("theta",  "Theta")
+    fig_rho   = _greek_fig("rho",    "Rho")
 
-    fig_delta = greek_fig("delta",  "Δ  (Delta)")
-    fig_gamma = greek_fig("gamma",  "Γ  (Gamma)")
-    fig_vega  = greek_fig("vega",   "Vega")
-    fig_theta = greek_fig("theta",  "Theta")
-    fig_rho   = greek_fig("rho",    "Rho")
+    # ---------- 4) Tableau positions (TOTAL inclus) ----------
+    snapshot_df = portfolio.state_at(idx)
 
-    # ---------- 4) Tableau des positions (Entry/MtM/uPnL + Greeks + TOTAL) ----------
-    snapshot_df = portfolio.state_at(idx)  # renvoie déjà la ligne TOTAL et l’ordre des colonnes
-    table_data = snapshot_df.to_dict("records")
-    columns = [{"name": c, "id": c} for c in snapshot_df.columns]
+    # Copie dédiée à l'AFFICHAGE (on tente une conversion numérique colonne par colonne)
+    display_df = snapshot_df.copy()
 
-    # ---------- 5) Choix du contenu de page ----------
+    def _fmt_fr_3dec_num(x: float) -> str:
+        # 1234567.89 -> "1 234 567,89"
+        s = f"{x:,.3f}"
+        return s.replace(",", " ").replace(".", ",")
+
+    for c in display_df.columns:
+        # Essaie de convertir la colonne en numérique
+        as_num = pd.to_numeric(display_df[c], errors="coerce")
+        # Indices où la conversion a réussi
+        mask = as_num.notna()
+        # Formate ces valeurs à 3 décimales (fr)
+        display_df.loc[mask, c] = as_num[mask].map(_fmt_fr_3dec_num)
+        # Les NaN deviennent chaîne vide pour l'affichage propre
+        display_df[c] = display_df[c].where(display_df[c].notna(), "")
+
+    table_data = display_df.to_dict("records")
+    columns = [{"name": c, "id": c} for c in display_df.columns]
+
+
+    # ---------- 5) Pages + responsive layout ----------
     if page_idx == 0:
-        content = dcc.Graph(figure=fig_paths, style={"height": "500px"})
-    elif page_idx == 1:
-        greeks_grid = html.Div(
-            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "10px"},
+        # Afficher le slider sur cette page
+        slider_style = {"display": "block", "marginTop": "10px"}
+
+        # Conteneur pleine hauteur (déduit l'espace du header/nav)
+        content = html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateRows": "minmax(0, 50%) 1fr",  # 50% du panneau pour le graphe, puis le tableau
+                "gap": "10px",
+                "height": "calc(100vh - 140px)",  # ajuste si besoin selon ton header/padding
+            },
             children=[
-                dcc.Graph(figure=fig_pnl,   style={"height": "230px"}),
-                dcc.Graph(figure=fig_delta, style={"height": "230px"}),
-                dcc.Graph(figure=fig_gamma, style={"height": "230px"}),
-                dcc.Graph(figure=fig_vega,  style={"height": "230px"}),
-                dcc.Graph(figure=fig_theta, style={"height": "230px"}),
-                dcc.Graph(figure=fig_rho,   style={"height": "230px"}),
+                dcc.Graph(
+                    figure=fig_paths,
+                    style={"height": "100%", "width": "100%"},
+                    config={"responsive": True},
+                ),
+                dash_table.DataTable(
+                    data=table_data,
+                    columns=columns,
+                    page_size=15,
+                    style_table={
+                        "overflowX": "auto",
+                        "overflowY": "auto",
+                        "height": "100%",
+                    },
+                    style_cell={"textAlign": "right"},
+                    style_data_conditional=[
+                        {
+                            "if": {"filter_query": "{option_type} = 'TOTAL'"},
+                            "fontWeight": "bold",
+                            "backgroundColor": "#f5f5f5",
+                        }
+                    ],
+                ),
             ],
         )
-        content = greeks_grid
-    else:  # page 2 : tableau détaillé
-        content = dash_table.DataTable(
-            data=table_data,
-            columns=columns,
-            page_size=15,
-            style_table={"overflowX": "auto"},
-            style_cell={"textAlign": "right"},
-            style_data_conditional=[
-                {  # met en évidence la ligne TOTAL
-                    "if": {"filter_query": "{option_type} = 'TOTAL'"},
-                    "fontWeight": "bold",
-                    "backgroundColor": "#f5f5f5",
-                }
+    else:
+        # Masquer le slider sur cette page
+        slider_style = {"display": "none"}
+
+        # Grille 2x3 pleine hauteur, chaque graphe prend 100%
+        content = html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
+                "gridTemplateRows": "repeat(3, minmax(0, 1fr))",
+                "gap": "10px",
+                "height": "calc(100vh - 120px)", 
+            },
+            children=[
+                dcc.Graph(figure=fig_pnl,   style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_delta, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_gamma, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_vega,  style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_theta, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_rho,   style={"height": "100%", "width": "100%"}, config={"responsive": True}),
             ],
         )
 
-    return content, table_data, columns
-
+    return content, table_data, columns, slider_style
 
 
 
