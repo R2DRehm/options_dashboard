@@ -21,6 +21,12 @@ import pandas as pd
 import dash
 from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx
 
+from types import SimpleNamespace
+from simulation.vol_rates_simulation import (
+    generate_paths_heston2f,
+    generate_paths_garch,
+)
+
 
 from simulation.vol_rates_simulation import generate_paths_heston2f, generate_paths_garch
 from portfolio.portfolio import Portfolio, OptionOrder
@@ -231,6 +237,106 @@ def main_panel() -> html.Div:
     )
 
 
+# ==== Helpers pour Greeks BS + cash + sweep spot ====
+def _phi(x: float) -> float:  # densité N(0,1)
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+def bs_price_greeks(is_call: bool, S: float, K: float, r: float, sigma: float, tau: float) -> dict:
+    tau = max(float(tau), 0.0)
+    if tau == 0.0 or sigma <= 0.0:
+        # Valeur intrinsèque; on met des grecs "calmes" (pas de gamma/vega/theta/rho)
+        price = max(S - K, 0.0) if is_call else max(K - S, 0.0)
+        delta = 1.0 if (is_call and S > K) else (-1.0 if (not is_call and S < K) else 0.0)
+        return {"price": price, "delta": delta, "gamma": 0.0, "vega": 0.0, "theta": 0.0, "rho": 0.0}
+
+    sqrt_tau = math.sqrt(tau)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau)
+    d2 = d1 - sigma * sqrt_tau
+    Nd1 = _N(d1); Nd2 = _N(d2); nd1 = _phi(d1)
+
+    if is_call:
+        price = S * Nd1 - K * math.exp(-r * tau) * Nd2
+        delta = Nd1
+        theta = -(S * nd1 * sigma) / (2.0 * sqrt_tau) - r * K * math.exp(-r * tau) * Nd2
+        rho   = K * tau * math.exp(-r * tau) * Nd2
+    else:
+        price = K * math.exp(-r * tau) * _N(-d2) - S * _N(-d1)
+        delta = Nd1 - 1.0
+        theta = -(S * nd1 * sigma) / (2.0 * sqrt_tau) + r * K * math.exp(-r * tau) * _N(-d2)
+        rho   = -K * tau * math.exp(-r * tau) * _N(-d2)
+
+    gamma = nd1 / (S * sigma * sqrt_tau)
+    vega  = S * nd1 * sqrt_tau
+    return {"price": price, "delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho}
+
+def _money_market(path: dict) -> np.ndarray:
+    t = path["t_fine"]; r = path["r"]
+    dt = np.diff(t, prepend=t[0])
+    # compte cash discret: (1 + r*dt). NB: dt[0]=0 → facteur 1 au départ
+    return np.cumprod(1.0 + r * dt)
+
+def cash_at_idx(path: dict, orders: list, idx_snap: int) -> float:
+    """Valeur du compte cash au snapshot idx (flux d'entrée actualisés)."""
+    if not orders:
+        return 0.0
+    B = _money_market(path)
+    j = int(path["coarse_idx"][idx_snap])
+    cash = 0.0
+    for od in orders:
+        if int(od.get("time_idx", 0)) <= idx_snap:
+            j0 = int(path["coarse_idx"][int(od.get("time_idx", 0))])
+            entry = float(od.get("entry_price", 0.0))
+            qty   = float(od.get("quantity", 0.0))
+            cf = - qty * entry
+            cash += cf * (B[j] / B[j0])
+    return cash
+
+def spot_sweep_df(path: dict, orders: list, idx_snap: int, n_points: int = 121, span: float = 0.5) -> tuple[pd.DataFrame, float]:
+    """Courbes Value/PNL/Greeks en fonction du spot autour du spot courant."""
+    j = int(path["coarse_idx"][idx_snap])
+    S_now = float(path["S"][j])
+    r_now = float(path["r"][j])
+    sigma_now = float(np.sqrt(path["V"][j]))
+    t_now = float(path["t_fine"][j])
+
+    S_min = max(1e-8, S_now * (1.0 - span))
+    S_max = S_now * (1.0 + span)
+    S_grid = np.linspace(S_min, S_max, n_points)
+
+    active = [od for od in (orders or []) if int(od.get("time_idx", 0)) <= idx_snap]
+    cash_now = cash_at_idx(path, orders or [], idx_snap)
+
+    rows = {"spot": [], "value": [], "pnl": [], "delta": [], "gamma": [], "vega": [], "theta": [], "rho": []}
+    for S in S_grid:
+        tot_val = tot_delta = tot_gamma = tot_vega = tot_theta = tot_rho = 0.0
+        for od in active:
+            qty = float(od.get("quantity", 0.0))
+            typ = od.get("option_type", "underlying")
+            if typ == "underlying":
+                price = S
+                delta = 1.0; gamma = vega = theta = rho = 0.0
+            else:
+                is_call = (typ == "call")
+                K = float(od.get("strike", 0.0))
+                tau = max(float(od.get("maturity", 0.0)) - t_now, 0.0)
+                g = bs_price_greeks(is_call, S, K, r_now, sigma_now, tau)
+                price, delta, gamma, vega, theta, rho = g["price"], g["delta"], g["gamma"], g["vega"], g["theta"], g["rho"]
+            tot_val   += qty * price
+            tot_delta += qty * delta
+            tot_gamma += qty * gamma
+            tot_vega  += qty * vega
+            tot_theta += qty * theta
+            tot_rho   += qty * rho
+        rows["spot"].append(S)
+        rows["value"].append(tot_val)
+        rows["pnl"].append(tot_val + cash_now)  # PnL = valeur + cash courant
+        rows["delta"].append(tot_delta)
+        rows["gamma"].append(tot_gamma)
+        rows["vega"].append(tot_vega)
+        rows["theta"].append(tot_theta)
+        rows["rho"].append(tot_rho)
+
+    return pd.DataFrame(rows), S_now
 
 
 app.layout = html.Div(
@@ -255,9 +361,9 @@ app.layout = html.Div(
 def turn_page(prev, nxt, idx):
     triggered = ctx.triggered_id
     if triggered == "btn-prev":
-        idx = (idx - 1) % 2   # ← 2 pages
+        idx = (idx - 1) % 3
     elif triggered == "btn-next":
-        idx = (idx + 1) % 2
+        idx = (idx + 1) % 3
     return idx
 
 @app.callback(
@@ -269,15 +375,23 @@ def turn_page(prev, nxt, idx):
     State("s0", "value"), State("v0", "value"), State("r0", "value"),
     State("mu", "value"), State("kappa_v", "value"), State("theta_v", "value"), State("xi", "value"),
     State("kappa_r", "value"), State("theta_r", "value"), State("sigma_r", "value"),
-    State("rho", "value"), State("T", "value"), State("Nf", "value"), State("Nc", "value"), State("seed", "value"), State("vol-model","value"),
+    State("rho", "value"), State("T", "value"), State("Nf", "value"), State("Nc", "value"),
+    State("seed", "value"), State("vol-model", "value"),
     prevent_initial_call=True,
 )
-def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, theta_r, sigma_r, rho, T, Nf, Nc, seed, vol_model):
-    params = PathParams(mu=mu, kappa_v=kappa_v, theta_v=theta_v, xi=xi,
-                        kappa_r=kappa_r, theta_r=theta_r, sigma_r=sigma_r, rho=rho)
+def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi,
+                      kappa_r, theta_r, sigma_r, rho, T, Nf, Nc, seed, vol_model):
 
+    # objet "params" sans PathParams, mais avec les mêmes attributs
+    params = SimpleNamespace(
+        mu=mu, kappa_v=kappa_v, theta_v=theta_v, xi=xi,
+        kappa_r=kappa_r, theta_r=theta_r, sigma_r=sigma_r, rho=rho
+    )
+
+    # seed vide => aléatoire, sinon reproductible
     seed_val = None if seed in (None, "") else int(seed)
 
+    # route selon le modèle sélectionné
     if vol_model == "h2f":
         paths = generate_paths_heston2f(S0, V0, r0, params, float(T), int(Nf), int(Nc), seed=seed_val)
     elif vol_model == "garch":
@@ -285,6 +399,7 @@ def simulate_callback(n_clicks, S0, V0, r0, mu, kappa_v, theta_v, xi, kappa_r, t
 
     paths_json = {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in paths.items()}
     return paths_json, [], int(Nc) - 1, 0
+
 
 
 @app.callback(
@@ -415,6 +530,24 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
     fig_theta = _greek_fig("theta",  "Theta")
     fig_rho   = _greek_fig("rho",    "Rho")
 
+
+    # ---------- Courbes vs Spot ----------
+    sweep_df, S_now = spot_sweep_df(path, orders or [], idx_snap=idx, n_points=121, span=0.5)
+
+    def _spot_fig(ycol: str, title: str):
+        f = px.line(sweep_df, x="spot", y=ycol, title=title)
+        f.add_vline(x=S_now, line_width=1, line_dash="dot", line_color="black")
+        f.update_layout(autosize=True, margin=dict(l=50, r=20, t=30, b=20))
+        return f
+
+    fig_pnl_spot   = _spot_fig("pnl",   "PnL vs Spot")
+    fig_delta_spot = _spot_fig("delta", "Δ (Delta) vs Spot")
+    fig_gamma_spot = _spot_fig("gamma", "Γ (Gamma) vs Spot")
+    fig_vega_spot  = _spot_fig("vega",  "Vega vs Spot")
+    fig_theta_spot = _spot_fig("theta", "Theta vs Spot")
+    fig_rho_spot   = _spot_fig("rho",   "Rho vs Spot")
+
+
     # ---------- 4) Tableau positions (TOTAL inclus) ----------
     snapshot_df = portfolio.state_at(idx)
 
@@ -479,7 +612,7 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
                 ),
             ],
         )
-    else:
+    elif page_idx == 1:
         # Masquer le slider sur cette page
         slider_style = {"display": "none"}
 
@@ -499,6 +632,26 @@ def update_view(idx: int, paths_json: dict | None, orders: list | None, page_idx
                 dcc.Graph(figure=fig_vega,  style={"height": "100%", "width": "100%"}, config={"responsive": True}),
                 dcc.Graph(figure=fig_theta, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
                 dcc.Graph(figure=fig_rho,   style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+            ],
+        )
+
+    else:  # page_idx == 2 → GRECS vs SPOT
+        slider_style = {"display": "block", "marginTop": "10px"}  # ← on garde le slider visible
+        content = html.Div(
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
+                "gridTemplateRows": "repeat(3, minmax(0, 1fr))",
+                "gap": "10px",
+                "height": "calc(100vh - 120px)",
+            },
+            children=[
+                dcc.Graph(figure=fig_pnl_spot,   style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_delta_spot, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_gamma_spot, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_vega_spot,  style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_theta_spot, style={"height": "100%", "width": "100%"}, config={"responsive": True}),
+                dcc.Graph(figure=fig_rho_spot,   style={"height": "100%", "width": "100%"}, config={"responsive": True}),
             ],
         )
 
